@@ -19,6 +19,7 @@ Learning and having a flexible cluster management repo obv
 - (Kind for running local clusters) https://kind.sigs.k8s.io/
 - (terraform installation) https://developer.hashicorp.com/terraform/install
 - (installing kubectl) https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+- (community docs) https://github.com/kubernetes/community
 
 ## todo
 ### init-cluster.sh
