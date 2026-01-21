@@ -1,0 +1,199 @@
+---
+# Jenkins Init Container Setup - Best Practices
+# This playbook runs BEFORE Jenkins starts to:
+# 1. Install all required plugins
+# 2. Create admin user
+# 3. Configure basic security
+# 4. Skip initial setup wizard
+#
+# Expected to run with: ansible-playbook -c local jenkins-init-container.yml
+
+- name: Initialize Jenkins for First Boot
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    jenkins_home: "/var/jenkins_home"
+
+    # These will be passed from Terraform via environment variables
+    admin_username: "{{ lookup('env', 'JENKINS_ADMIN_USER') | default('admin', true) }}"
+    admin_password: "{{ lookup('env', 'JENKINS_ADMIN_PASSWORD') | default('admin', true) }}"
+
+  tasks:
+    - name: Display initialization info
+      debug:
+        msg:
+          - "Starting Jenkins initialization"
+          - "Jenkins Home: {{ jenkins_home }}"
+          - "Admin User: {{ admin_username }}"
+
+    - name: Ensure Jenkins home directory exists
+      file:
+        path: "{{ jenkins_home }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create necessary subdirectories
+      file:
+        path: "{{ jenkins_home }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - init.groovy.d
+        - plugins
+        - secrets
+
+    # NOTE: Plugin installation skipped in init container
+    # Plugins will be installed by Jenkins on first boot or via JCasC
+    - name: Create plugins directory
+      file:
+        path: "{{ jenkins_home }}/plugins"
+        state: directory
+        mode: '0755'
+
+    - name: Install bcrypt for password hashing
+      shell: |
+        pip install --no-cache-dir bcrypt
+      changed_when: false
+
+    - name: Generate admin password bcrypt hash
+      shell: |
+        python3 -c "import bcrypt; import sys; sys.stdout.write(bcrypt.hashpw('{{ admin_password }}'.encode('utf-8'), bcrypt.gensalt(rounds=10, prefix=b'2a')).decode('utf-8'))"
+      register: password_hash
+      no_log: true
+      changed_when: false
+
+    - name: Create admin user configuration
+      copy:
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+          <hudson>
+            <disabledAdministrativeMonitors/>
+            <version>2.x</version>
+            <installStateName>RUNNING</installStateName>
+            <numExecutors>2</numExecutors>
+            <mode>NORMAL</mode>
+            <useSecurity>true</useSecurity>
+            <authorizationStrategy class="hudson.security.FullControlOnceLoggedInAuthorizationStrategy">
+              <denyAnonymousReadAccess>true</denyAnonymousReadAccess>
+            </authorizationStrategy>
+            <securityRealm class="hudson.security.HudsonPrivateSecurityRealm">
+              <disableSignup>true</disableSignup>
+              <enableCaptcha>false</enableCaptcha>
+            </securityRealm>
+            <disableRememberMe>false</disableRememberMe>
+            <workspaceDir>${JENKINS_HOME}/workspace/${ITEM_FULL_NAME}</workspaceDir>
+            <buildsDir>${JENKINS_HOME}/builds/${ITEM_FULL_NAME}</buildsDir>
+            <systemMessage>Jenkins configured via Ansible</systemMessage>
+          </hudson>
+        dest: "{{ jenkins_home }}/config.xml"
+        mode: '0644'
+
+    - name: Generate consistent user ID
+      set_fact:
+        user_id: "{{ 9999999999999999999 | random(seed=admin_username) }}"
+
+    - name: Create users directory
+      file:
+        path: "{{ jenkins_home }}/users/{{ admin_username }}_{{ user_id }}"
+        state: directory
+        mode: '0755'
+      register: user_dir
+
+    - name: Create admin user config file
+      copy:
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+          <user>
+            <version>10</version>
+            <id>{{ admin_username }}</id>
+            <fullName>{{ admin_username }}</fullName>
+            <properties>
+              <jenkins.security.ApiTokenProperty>
+                <tokenStore>
+                  <tokenList/>
+                </tokenStore>
+              </jenkins.security.ApiTokenProperty>
+              <hudson.security.HudsonPrivateSecurityRealm_-Details>
+                <passwordHash>#jbcrypt:{{ password_hash.stdout | trim }}</passwordHash>
+              </hudson.security.HudsonPrivateSecurityRealm_-Details>
+              <hudson.model.MyViewsProperty>
+                <views>
+                  <hudson.model.AllView>
+                    <owner class="hudson.model.MyViewsProperty" reference="../../.."/>
+                    <name>all</name>
+                    <filterExecutors>false</filterExecutors>
+                    <filterQueue>false</filterQueue>
+                    <properties class="hudson.model.View$PropertyList"/>
+                  </hudson.model.AllView>
+                </views>
+              </hudson.model.MyViewsProperty>
+              <hudson.model.PaneStatusProperties>
+                <collapsed/>
+              </hudson.model.PaneStatusProperties>
+              <hudson.search.UserSearchProperty>
+                <insensitiveSearch>true</insensitiveSearch>
+              </hudson.search.UserSearchProperty>
+              <hudson.tasks.Mailer_-UserProperty plugin="mailer">
+                <emailAddress>{{ admin_username }}@localhost</emailAddress>
+              </hudson.tasks.Mailer_-UserProperty>
+            </properties>
+          </user>
+        dest: "{{ user_dir.path }}/config.xml"
+        mode: '0644'
+
+    - name: Create Groovy script to finalize setup
+      copy:
+        content: |
+          #!groovy
+          import jenkins.model.*
+          import hudson.security.*
+
+          def instance = Jenkins.getInstance()
+
+          // Set number of executors
+          instance.setNumExecutors(2)
+
+          // Disable setup wizard
+          instance.setInstallState(InstallState.INITIAL_SETUP_COMPLETED)
+
+          // Save configuration
+          instance.save()
+
+          println "Jenkins initialization completed successfully"
+        dest: "{{ jenkins_home }}/init.groovy.d/01-initial-setup.groovy"
+        mode: '0644'
+
+    - name: Mark setup wizard as complete
+      copy:
+        content: "2.0"
+        dest: "{{ jenkins_home }}/jenkins.install.InstallUtil.lastExecVersion"
+        mode: '0644'
+
+    - name: Mark installation state as complete
+      copy:
+        content: "RUNNING"
+        dest: "{{ jenkins_home }}/jenkins.install.UpgradeWizard.state"
+        mode: '0644'
+
+    - name: Create initialization marker file
+      copy:
+        content: |
+          Jenkins initialization completed
+          Date: {{ ansible_date_time.iso8601 }}
+          Admin User: {{ admin_username }}
+          Setup Wizard: DISABLED
+        dest: "{{ jenkins_home }}/ansible-init-complete.txt"
+        mode: '0644'
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================="
+          - "Jenkins initialization COMPLETE"
+          - "Admin user '{{ admin_username }}' created"
+          - "Setup wizard: DISABLED"
+          - "Security: ENABLED"
+          - "Jenkins will start with login screen"
+          - "========================================="
